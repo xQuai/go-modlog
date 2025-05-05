@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  twitch-modlog:
+    build: .
+    container_name: twitch-modlog
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config
+    environment:
+      - CONFIG_PATH=/app/config/config.yml
+    networks:
+      - twitch-network
+
+networks:
+  twitch-network:
+    name: twitch-network

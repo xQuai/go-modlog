@@ -1,0 +1,14 @@
+twitch:
+    userid: ""
+    clientid: ""
+    accesstoken: ""
+modlog:
+  channel:
+    - name: ""
+      userid: ""
+      discord:
+        webhook: ""
+    - name: ""
+      userid: ""
+      discord:
+        webhook: ""
