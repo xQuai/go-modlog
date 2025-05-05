@@ -1,0 +1,10 @@
+twitch:
+    userid: "74471586"
+    clientid: ""
+    accesstoken: ""
+modlog:
+  channel:
+    - name: "quai1"
+      userid: "74471586"
+      discord:
+        webhook: "https://discord.com/api/webhooks/xxxxxxxx/xxxxxxxx"
