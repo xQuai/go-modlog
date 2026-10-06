@@ -22,6 +22,8 @@ go.work
 
 ## configs
 config*.yml
+token.json
+.token-*.json
 
 # idea files
 .idea

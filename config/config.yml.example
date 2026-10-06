@@ -1,7 +1,11 @@
 twitch:
+    # optional, the user id is taken from the authorized token
     userid: ""
     clientid: ""
-    accesstoken: ""
+    # optional, only needed for apps with client type "Confidential"
+    clientsecret: ""
+    # optional, default: token.json next to this config file
+    tokenfile: ""
 modlog:
   channel:
     - name: ""

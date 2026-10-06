@@ -1,432 +1,238 @@
 package main
 
 import (
-	"fmt"
-	"github.com/joeyak/go-twitch-eventsub/v3"
-	"github.com/nil-go/konf"
-	"github.com/nil-go/konf/provider/env"
-	"github.com/nil-go/konf/provider/file"
-	"github.com/typical-developers/discord-webhooks-go/webhooks"
-	"gopkg.in/yaml.v3"
+	"context"
+	"errors"
+	"log"
 	"os"
-	"strconv"
+	"os/signal"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"github.com/joeyak/go-twitch-eventsub/v3"
 )
 
 // Variables
 var (
-	broadcasters = []string{}
-	configPath   = os.Getenv("CONFIG_PATH")
+	configPath = os.Getenv("CONFIG_PATH")
+	debug      = strings.EqualFold(os.Getenv("LOG_LEVEL"), "debug")
 )
 
 const (
-	twitchUserCardURL = "[%s](https://twitch.tv/popout/%s/viewercard/%s)"
-	twitchChannelURL  = "[%s](https://twitch.tv/%s)"
+	reconnectMaxBackoff = time.Minute
+	shutdownTimeout     = 10 * time.Second
 )
 
-// Struct for config
-type Config struct {
-	Twitch struct {
-		Userid      string `yaml:"userid"`
-		Clientid    string `yaml:"clientid"`
-		Accesstoken string `yaml:"accesstoken"`
-	} `yaml:"twitch"`
-	Modlog struct {
-		Channel []struct {
-			Name    string `yaml:"name"`
-			Userid  string `yaml:"userid"`
-			Discord struct {
-				Webhook string `yaml:"webhook"`
-			} `yaml:"discord"`
-		} `yaml:"channel"`
-	} `yaml:"modlog"`
-}
-
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// Read config
 	config, errConf := ReadConfiguration(configPath)
 	if errConf != nil {
-		panic(errConf)
+		log.Fatalf("could not read config: %v", errConf)
+	}
+	if config.Twitch.Clientid == "" {
+		log.Fatalf("twitch.clientid is missing in config")
 	}
 
-	// Add channels from config to broadcasters
-	broadcasters := addChannels(config, broadcasters)
+	// Broadcaster user id -> discord webhook
+	webhookURLs := webhooksByUserID(config)
+	if len(webhookURLs) == 0 {
+		log.Fatalf("no channel with userid and discord webhook in config")
+	}
+
+	// Token
+	reconnect := make(chan struct{}, 1)
+	tokens := NewTokenManager(config.Twitch.Clientid, config.Twitch.Clientsecret, config.Twitch.Tokenfile)
+	tokens.OnReauth = func() {
+		// new authorization means the old subscriptions are gone, so reconnect and subscribe again
+		select {
+		case reconnect <- struct{}{}:
+		default:
+		}
+	}
+	if err := tokens.Init(ctx); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		log.Fatalf("could not get twitch token: %v", err)
+	}
+	if config.Twitch.Userid != "" && config.Twitch.Userid != tokens.UserID() {
+		log.Printf("WARNING: twitch.userid %s does not match the authorized user %s, using %s", config.Twitch.Userid, tokens.UserID(), tokens.UserID())
+	}
+	go tokens.Run(ctx)
+
+	sender := NewDiscordSender()
+
+	runEventSub(ctx, tokens, sender, webhookURLs, reconnect)
+
+	log.Printf("shutting down, sending remaining messages")
+	sender.Close(shutdownTimeout)
+}
+
+// Keep the eventsub websocket connected, reconnect with backoff
+func runEventSub(ctx context.Context, tokens *TokenManager, sender *DiscordSender, webhookURLs map[string]string, reconnect <-chan struct{}) {
+	backoff := time.Second
+	for ctx.Err() == nil {
+		start := time.Now()
+		err := connectEventSub(ctx, tokens, sender, webhookURLs, reconnect)
+		if ctx.Err() != nil {
+			return
+		}
+
+		if time.Since(start) > reconnectMaxBackoff {
+			backoff = time.Second
+		}
+		log.Printf("EVENTSUB: connection closed (%v), reconnecting in %s", err, backoff)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, reconnectMaxBackoff)
+	}
+}
+
+// One websocket session, returns when the connection is lost
+func connectEventSub(ctx context.Context, tokens *TokenManager, sender *DiscordSender, webhookURLs map[string]string, reconnect <-chan struct{}) error {
+	connCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	var lastMessage, keepaliveTimeout atomic.Int64
+	touch := func() { lastMessage.Store(time.Now().UnixNano()) }
+	touch()
 
 	// Init client
 	client := twitch.NewClient()
 
 	client.OnError(func(err error) {
-		fmt.Printf("ERROR: %v\n", err)
+		log.Printf("EVENTSUB ERROR: %v", err)
 	})
 	client.OnWelcome(func(message twitch.WelcomeMessage) {
-		fmt.Printf("WELCOME: %v\n", message)
+		touch()
+		keepaliveTimeout.Store(int64(message.Payload.Session.KeepaliveTimeoutSeconds))
+		log.Printf("EVENTSUB: connected, session %s", message.Payload.Session.ID)
 
-		// Subscribe to events
-		events := []twitch.EventSubscription{
-			twitch.SubChannelModerate,
-		}
-
-		for _, event := range events {
-			for _, broadcaster := range broadcasters {
-				fmt.Printf("subscribing to %s for streamer %s\n", event, broadcaster)
-				_, err := twitch.SubscribeEvent(twitch.SubscribeRequest{
-					SessionID:   message.Payload.Session.ID,
-					ClientID:    config.Twitch.Clientid,
-					AccessToken: config.Twitch.Accesstoken,
-					Event:       event,
-					Condition: map[string]string{
-						"broadcaster_user_id": broadcaster,
-						"moderator_user_id":   config.Twitch.Userid,
-					},
-				})
-				if err != nil {
-					fmt.Printf("ERROR: %v\n", err)
-					return
-				}
-			}
-		}
+		subscribeAll(connCtx, tokens, message.Payload.Session.ID, webhookURLs)
 	})
 
 	// Notification Message from Websocketserver
 	client.OnNotification(func(message twitch.NotificationMessage) {
-		fmt.Printf("NOTIFICATION: %s: %#v\n", message.Payload.Subscription.Type, message.Payload.Event)
+		touch()
+		if debug {
+			log.Printf("NOTIFICATION: %s: %s", message.Payload.Subscription.Type, message.Payload.Event)
+		}
 	})
 
 	// Keep Alive Message from Websocketserver
 	client.OnKeepAlive(func(message twitch.KeepAliveMessage) {
-		fmt.Printf("KEEPALIVE: %v\n", message)
+		touch()
+		if debug {
+			log.Printf("KEEPALIVE: %v", message.Metadata.MessageTimestamp)
+		}
+	})
+
+	// Reconnect Message from Websocketserver, handled by the library
+	client.OnReconnect(func(message twitch.ReconnectMessage) {
+		touch()
+		log.Printf("EVENTSUB: server requested reconnect")
 	})
 
 	// Revoke Message from Websocketserver
 	client.OnRevoke(func(message twitch.RevokeMessage) {
-		fmt.Printf("REVOKE: %v\n", message)
-	})
-
-	// Raw Message from Websocketserver
-	client.OnRawEvent(func(event string, metadata twitch.MessageMetadata, subscription twitch.PayloadSubscription) {
-		fmt.Printf("EVENT[%s]: %s: %s\n", subscription.Type, metadata, event)
-	})
-
-	// Channel Ban Message from Websocketserver
-	client.OnEventChannelBan(func(message twitch.EventChannelBan) {
-		fmt.Printf("EVENT[BAN]: %v\n", message)
+		touch()
+		sub := message.Payload.Subscription
+		log.Printf("EVENTSUB: subscription %s for %s revoked: %s", sub.Type, sub.Condition["broadcaster_user_id"], sub.Status)
+		if sub.Status == "authorization_revoked" {
+			// refresh fails if the authorization was revoked and starts the device code flow
+			if err := tokens.Refresh(ctx); err != nil {
+				log.Printf("AUTH ERROR: %v", err)
+			}
+		}
 	})
 
 	// Channel Moderation Event Message from Websocketserver
 	client.OnEventChannelModerate(func(message twitch.EventChannelModerate) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("ERROR: could not handle %s event: %v", message.Action, r)
+			}
+		}()
 
-		webhook := webhooks.NewWebhookClientFromURL(getDiscordWebHookUrl(config, strings.ToLower(message.BroadcasterUserName)))
-		payload := webhooks.WebhookPayload{}
-
-		embed := createBaseEmbed(message.Action, message)
-		if handler, exists := eventHandlers[message.Action]; exists {
-			handler(message, embed)
-		} else {
-			handleDefault(message, embed)
+		webhookURL, ok := webhookURLs[message.BroadcasterUserId]
+		if !ok {
+			log.Printf("ERROR: no discord webhook for channel %s (%s)", message.BroadcasterUserLogin, message.BroadcasterUserId)
+			return
 		}
-		payload.Embeds = append(payload.Embeds, embed)
-
-		// Send Message to Discord
-		_, err := webhook.SendMessage(&payload)
-		if err != nil {
-			fmt.Printf("Error sending webhook: %v\n", err.Error())
-		}
-
+		log.Printf("EVENT: %s in %s by %s", message.Action, message.BroadcasterUserLogin, message.ModeratorUserLogin)
+		sender.Enqueue(webhookURL, buildEmbed(message))
 	})
 
-	err := client.Connect()
-	if err != nil {
-		fmt.Printf("Could not connect client: %v\n", err)
-	}
-}
-
-// Read Configuration from file
-func ReadConfiguration(configPath string) (Config, error) {
-	var config konf.Config
-
-	err := config.Load(file.New(configPath, file.WithUnmarshal(yaml.Unmarshal)))
-	if err != nil {
-		return Config{}, err
-	}
-
-	err = config.Load(env.New())
-	if err != nil {
-		return Config{}, err
-	}
-
-	var res Config
-
-	err = config.Unmarshal("", &res)
-	if err != nil {
-		return Config{}, err
-	}
-	return res, nil
-}
-
-// Add Channels to array
-func addChannels(config Config, channels []string) []string {
-	for _, channel := range config.Modlog.Channel {
-		if channel.Userid != "" {
-			channels = append(channels, channel.Userid)
-
+	// Watchdog: twitch sends a keepalive at least every keepalive_timeout_seconds
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case <-reconnect:
+				cancel(errors.New("reconnect after new authorization"))
+				return
+			case <-ticker.C:
+				timeout := time.Duration(keepaliveTimeout.Load())*time.Second + 10*time.Second
+				if time.Since(time.Unix(0, lastMessage.Load())) > timeout {
+					cancel(errors.New("keepalive timeout"))
+					return
+				}
+			}
 		}
+	}()
+
+	err := client.ConnectWithContext(connCtx)
+	_ = client.Close()
+	if err == nil {
+		err = context.Cause(connCtx)
 	}
-	return channels
+	if err == nil {
+		err = errors.New("connection closed")
+	}
+	return err
 }
 
-// Get Discord Webhook URL by Channel Name
-func getDiscordWebHookUrl(config Config, channel string) string {
-	for _, c := range config.Modlog.Channel {
-		if c.Name == channel {
-			return c.Discord.Webhook
+// Subscribe channel.moderate for all channels, a failing channel does not stop the others
+func subscribeAll(ctx context.Context, tokens *TokenManager, sessionID string, webhookURLs map[string]string) {
+	for broadcaster := range webhookURLs {
+		err := subscribe(ctx, tokens, sessionID, broadcaster)
+		if err != nil && strings.Contains(err.Error(), "401") {
+			log.Printf("EVENTSUB: subscribe unauthorized, refreshing token")
+			if errRefresh := tokens.Refresh(ctx); errRefresh != nil {
+				log.Printf("AUTH ERROR: %v", errRefresh)
+			}
+			err = subscribe(ctx, tokens, sessionID, broadcaster)
 		}
+		if err != nil {
+			log.Printf("EVENTSUB ERROR: could not subscribe for channel %s: %v", broadcaster, err)
+			continue
+		}
+		log.Printf("EVENTSUB: subscribed to %s for channel %s", twitch.SubChannelModerate, broadcaster)
 	}
-	return ""
 }
 
-// create common fields
-func createBaseEmbed(action string, message twitch.EventChannelModerate) *webhooks.DiscordEmbed {
-	embed := &webhooks.DiscordEmbed{}
-	embed.SetTitle(fmt.Sprintf("[%s] Twitch Modlog EventSub", strings.ToUpper(action)))
-	embed.SetTimestamp(time.Now())
-
-	// Gemeinsame Felder
-	embedFieldChannel := embed.AddField()
-	embedFieldChannel.SetName("Channel")
-	embedFieldChannel.SetValue(fmt.Sprintf(twitchChannelURL, message.BroadcasterUserName, message.BroadcasterUserName))
-	embedFieldChannel.SetInline(true)
-
-	embedFieldModerator := embed.AddField()
-	embedFieldModerator.SetName("Moderator")
-	embedFieldModerator.SetValue(message.ModeratorUserName)
-	embedFieldModerator.SetInline(true)
-
-	return embed
-}
-
-var eventHandlers = map[string]func(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed){
-	"timeout":               handleTimeout,
-	"ban":                   handleBan,
-	"unban":                 handleUnban,
-	"untimeout":             handleUntimeout,
-	"delete":                handleDelete,
-	"vip":                   handleVip,
-	"uncip":                 handleUnVip,
-	"mod":                   handleMod,
-	"unmod":                 handleUnMod,
-	"add_blocked_term":      handleAddBlockedTerm,
-	"add_permitted_term":    handleAddPermittedTerm,
-	"remove_permitted_term": handleRemovePermittedTerm,
-	"remove_blocked_term":   handleRemoveBlockedTerm,
-	"warn":                  handleWarn,
-	"raid":                  handleRaid,
-	"default":               handleDefault,
-}
-
-func handleDefault(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle(fmt.Sprintf("[DEFAULT] Twitch Modlog EventSub"))
-
-	embedField := embed.AddField()
-	embedField.SetName("Event")
-	embedField.SetValue(message.Action)
-	embedField.SetInline(true)
-}
-
-func handleTimeout(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[TIMEOUT] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Timeout.UserName, message.BroadcasterUserName, message.Timeout.UserName))
-	embedFieldUser.SetInline(true)
-	embedFieldReason := embed.AddField()
-	embedFieldReason.SetName("Reason")
-	embedFieldReason.SetValue("`" + message.Timeout.Reason + "`")
-	embedFieldReason.SetInline(false)
-	embedFieldTime := embed.AddField()
-	embedFieldTime.SetName("Expires at")
-	embedFieldTime.SetValue("<t:" + strconv.FormatInt(message.Timeout.ExpiresAt.Unix(), 10) + ":f>")
-	embedFieldTime.SetInline(false)
-
-	duration := message.Timeout.ExpiresAt.Sub(time.Now().Add(-1 * time.Second))
-	embedFieldDuration := embed.AddField()
-	embedFieldDuration.SetName("Duration")
-	embedFieldDuration.SetValue(fmt.Sprintf("%d Seconds", int(duration.Seconds())))
-	embedFieldDuration.SetInline(false)
-}
-
-func handleBan(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[BAN] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Ban.UserName, message.BroadcasterUserName, message.Ban.UserName))
-	embedFieldUser.SetInline(true)
-	embedFieldReason := embed.AddField()
-	embedFieldReason.SetName("Reason")
-	embedFieldReason.SetValue("`" + message.Ban.Reason + "`")
-	embedFieldReason.SetInline(false)
-
-}
-
-func handleUnban(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[UNBAN] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Unban.UserName, message.BroadcasterUserName, message.Unban.UserName))
-	embedFieldUser.SetInline(true)
-
-}
-
-func handleUntimeout(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[UNTIMEOUT] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Untimeout.UserName, message.BroadcasterUserName, message.Untimeout.UserName))
-	embedFieldUser.SetInline(true)
-
-}
-
-func handleDelete(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[DELETE] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Delete.UserName, message.BroadcasterUserName, message.Delete.UserName))
-	embedFieldUser.SetInline(true)
-	embedFieldMessage := embed.AddField()
-	embedFieldMessage.SetName("Message")
-	embedFieldMessage.SetValue("`" + message.Delete.MessageBody + "`")
-	embedFieldMessage.SetInline(false)
-}
-
-func handleVip(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[VIP] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Vip.UserName, message.BroadcasterUserName, message.Vip.UserName))
-	embedFieldUser.SetInline(true)
-
-}
-
-func handleUnVip(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[UNVIP] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Unvip.UserName, message.BroadcasterUserName, message.Unvip.UserName))
-	embedFieldUser.SetInline(true)
-
-}
-
-func handleMod(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[MOD] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Mod.UserName, message.BroadcasterUserName, message.Mod.UserName))
-	embedFieldUser.SetInline(true)
-
-}
-
-func handleUnMod(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[UNMOD] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Unmod.UserName, message.BroadcasterUserName, message.Unmod.UserName))
-	embedFieldUser.SetInline(true)
-
-}
-func handleAddBlockedTerm(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[ADD_BLOCKED_TERM] Twitch Modlog EventSub")
-
-	embedField := embed.AddField()
-	embedField.SetName("Action")
-	embedField.SetValue(message.AutomodTerms.Action)
-	embedField.SetInline(true)
-	embedFieldMessage := embed.AddField()
-	embedFieldMessage.SetName("Term")
-	embedFieldMessage.SetValue("`" + message.AutomodTerms.Terms[0] + "`")
-	embedFieldMessage.SetInline(true)
-	embedFieldAutomod := embed.AddField()
-	embedFieldAutomod.SetName("From Automod")
-	embedFieldAutomod.SetValue("`" + strconv.FormatBool(message.AutomodTerms.FromAutomod) + "`")
-	embedFieldAutomod.SetInline(true)
-}
-func handleAddPermittedTerm(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[ADD_PERMITTED_TERM] Twitch Modlog EventSub")
-
-	embedField := embed.AddField()
-	embedField.SetName("Action")
-	embedField.SetValue(message.AutomodTerms.Action)
-	embedField.SetInline(true)
-	embedFieldMessage := embed.AddField()
-	embedFieldMessage.SetName("Term")
-	embedFieldMessage.SetValue("`" + message.AutomodTerms.Terms[0] + "`")
-	embedFieldMessage.SetInline(true)
-	embedFieldAutomod := embed.AddField()
-	embedFieldAutomod.SetName("From Automod")
-	embedFieldAutomod.SetValue("`" + strconv.FormatBool(message.AutomodTerms.FromAutomod) + "`")
-	embedFieldAutomod.SetInline(true)
-
-}
-
-func handleRemovePermittedTerm(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[REMOVE_PERMITTED_TERM] Twitch Modlog EventSub")
-
-	embedField := embed.AddField()
-	embedField.SetName("Action")
-	embedField.SetValue(message.AutomodTerms.Action)
-	embedField.SetInline(true)
-	embedFieldMessage := embed.AddField()
-	embedFieldMessage.SetName("Term")
-	embedFieldMessage.SetValue("`" + message.AutomodTerms.Terms[0] + "`")
-	embedFieldMessage.SetInline(true)
-}
-
-func handleRemoveBlockedTerm(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[REMOVE_BLOCKED_TERM] Twitch Modlog EventSub")
-
-	embedField := embed.AddField()
-	embedField.SetName("Action")
-	embedField.SetValue(message.AutomodTerms.Action)
-	embedField.SetInline(true)
-	embedFieldMessage := embed.AddField()
-	embedFieldMessage.SetName("Term")
-	embedFieldMessage.SetValue("`" + message.AutomodTerms.Terms[0] + "`")
-	embedFieldMessage.SetInline(true)
-}
-
-func handleWarn(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[WARN] Twitch Modlog EventSub")
-
-	embedFieldUser := embed.AddField()
-	embedFieldUser.SetName("User")
-	embedFieldUser.SetValue(fmt.Sprintf(twitchUserCardURL, message.Warn.UserName, message.BroadcasterUserName, message.Warn.UserName))
-	embedFieldUser.SetInline(true)
-	embedFieldReason := embed.AddField()
-	embedFieldReason.SetName("Reason")
-	embedFieldReason.SetValue("`" + message.Warn.Reason + "`")
-	embedFieldReason.SetInline(false)
-
-}
-
-func handleRaid(message twitch.EventChannelModerate, embed *webhooks.DiscordEmbed) {
-	embed.SetTitle("[RAID] Twitch Modlog EventSub")
-
-	embedFieldRaidedChannel := embed.AddField()
-	embedFieldRaidedChannel.SetName("Raided Channel")
-	embedFieldRaidedChannel.SetValue(message.Raid.UserName)
-	embedFieldRaidedChannel.SetInline(false)
-	embedFieldRaidViewer := embed.AddField()
-	embedFieldRaidViewer.SetName("Viewer")
-	embedFieldRaidViewer.SetValue(strconv.Itoa(message.Raid.ViewerCount))
-	embedFieldRaidViewer.SetInline(false)
-
+func subscribe(ctx context.Context, tokens *TokenManager, sessionID string, broadcaster string) error {
+	_, err := twitch.SubscribeEventWithContext(ctx, twitch.SubscribeRequest{
+		SessionID:   sessionID,
+		ClientID:    tokens.clientID,
+		AccessToken: tokens.AccessToken(),
+		Event:       twitch.SubChannelModerate,
+		Condition: map[string]string{
+			"broadcaster_user_id": broadcaster,
+			"moderator_user_id":   tokens.UserID(),
+		},
+	})
+	return err
 }

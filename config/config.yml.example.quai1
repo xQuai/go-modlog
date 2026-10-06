@@ -1,7 +1,7 @@
 twitch:
     userid: "74471586"
     clientid: ""
-    accesstoken: ""
+    clientsecret: ""
 modlog:
   channel:
     - name: "quai1"
