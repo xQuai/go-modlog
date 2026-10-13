@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   twitch-modlog:
-    image: ghcr.io/xquai/twitch-modlog:latest
+    image: ghcr.io/xquai/go-modlog:master
     container_name: twitch-modlog
     restart: unless-stopped
     volumes:
