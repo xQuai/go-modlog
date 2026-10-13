@@ -24,7 +24,7 @@ WORKDIR /app
 COPY --from=builder /app/main .
 
 # Standardmäßiger Konfigurationspfad
-ENV CONFIG_PATH=/app/config/config.yaml
+ENV CONFIG_PATH=/app/config/config.yml
 
 # Erstellen des Konfigurationsverzeichnisses
 RUN mkdir -p /app/config
