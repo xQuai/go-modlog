@@ -1,4 +1,4 @@
-module twitch-find-bot-phrases
+module go-modlog
 
 go 1.24.0
 
