@@ -6,6 +6,8 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+  # called by docker.yml before a release is built
+  workflow_call:
 
 permissions:
   contents: read

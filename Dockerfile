@@ -1,6 +1,6 @@
 # Build Stage
 FROM golang:1.27.2-alpine AS builder
-MAINTAINER github.com/xquai
+LABEL org.opencontainers.image.authors="github.com/xquai"
 
 WORKDIR /app
 
@@ -15,8 +15,8 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o main .
 
 # Final Stage
-FROM alpine:latest
-MAINTAINER github.com/xquai
+FROM alpine:3.24
+LABEL org.opencontainers.image.authors="github.com/xquai"
 
 WORKDIR /app
 

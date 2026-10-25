@@ -2,7 +2,7 @@ module go-modlog
 
 go 1.24.0
 
-toolchain go1.24.2
+toolchain go1.27.2
 
 require (
 	github.com/joeyak/go-twitch-eventsub/v3 v3.0.1
