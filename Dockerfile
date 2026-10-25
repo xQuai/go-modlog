@@ -1,5 +1,5 @@
 # Build Stage
-FROM golang:1.24.2-alpine AS builder
+FROM golang:1.27.2-alpine AS builder
 MAINTAINER github.com/xquai
 
 WORKDIR /app
